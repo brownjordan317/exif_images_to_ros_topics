@@ -1,54 +1,61 @@
 # Skydio ROS2 Image Streamer
 
 This script streams Skydio JPG images over ROS 2 as if they were recorded live.
-Images are read from a directory, EXIF metadata (GPS + yaw) is extracted, and
-the frames are published as ROS 2 messages. The output can be recorded to a
-ros2 bag in real time.
+Images are read from a directory, EXIF metadata (GPS + yaw) is extracted, and frames are published as ROS 2 messages. The output can be recorded to a ROS 2 bag.
 
 ---
 
 ## Features
 
 * Stream JPG images as live camera frames via ROS 2
-* Extract GPS position and yaw from EXIF metadata (using exiftool)
-* Publish at a fixed Hz or replay using real capture timing
+* Extract GPS position and yaw from EXIF metadata using `exiftool`
+* Publish at a fixed Hz **or attempt real-time replay based on EXIF timestamps**
 * Optional multiprocessing-based preloading for maximum throughput
-* Automatic image resizing to prevent large bandwidth usage
+* Automatic resizing to control memory and bandwidth usage
 
 ---
 
-## Preloading vs. On-Demand (IMPORTANT TRADEOFF)
+## Preloading vs. On-Demand (IMPORTANT BEHAVIOR DIFFERENCE)
 
-You can either:
+You may choose **preloading** or **on-demand streaming**, but they behave differently:
 
-### 1. Preload All Images (Fastest Playback, More RAM)
+---
 
-* All images are decoded, resized, converted to ROS messages, and EXIF-parsed
-  before streaming begins.
-* Multiprocessing accelerates this stage.
-* Playback is extremely smooth, even at high publish rates (60–120 Hz).
-* **BUT large image sets (e.g., hundreds of 8K frames) can consume many gigabytes
-  of RAM.**
+### 1. Preload All Images (Recommended for Real-Time Replay)
 
-### 2. On-Demand Loading (Minimal RAM, But Slower)
+* Images are decoded, resized, converted to ROS messages, and EXIF-parsed **before streaming begins**.
+* Multiprocessing speeds this up significantly.
+* Streaming is extremely smooth and can sustain very high rates (60–120 Hz).
+* **Real-time playback (`--real_time`) ONLY works in preload mode** because:
 
-* Frames are decoded and resized at publish time.
-* Memory footprint is small because only one frame is held at once.
-* **High resolution images (8K+) might not load fast enough to sustain high Hz**
-  unless resizing is applied.
-* Best when working on limited hardware, mobile platforms, or long image sequences.
+  * EXIF timestamps are scanned during preload,
+  * The actual capture playback rate (Hz) is computed from them.
 
-Use `--preload` when:
+### ⚠️ Very Important: Real-time accuracy depends on your CPU
 
-* You need high FPS replay.
-* You have enough system memory.
-* You want smooth streaming without frame drops.
+Even in preload mode:
 
-Use on-demand streaming when:
+* Real-time Hz may fluctuate slightly,
+* Variations in system load and ROS scheduling can affect timing,
+* Very large images may introduce publishing latency.
 
-* You are memory-limited.
-* Frame timing isn’t critical.
-* Your images are extremely large and preloading is impractical.
+This is normal—true frame-accurate playback requires realtime system scheduling and pinned threads, which are outside scope.
+
+### 2. On-Demand Loading (Low RAM, No Real-Time Support)
+
+* Images are loaded and processed **at publish time**.
+* Only one image is in memory at once.
+* **EXIF timestamps are NOT fully scanned**, so:
+
+  * `--real_time` is **not supported** here,
+  * A fixed Hz must be provided (`--hz`).
+* High-resolution images (e.g., 8K) may decode too slowly to maintain high publish rates unless resizing is applied.
+
+Use on-demand when:
+
+* RAM is limited,
+* You don't need real-time history replay,
+* You are dealing with very large datasets.
 
 ---
 
@@ -56,19 +63,19 @@ Use on-demand streaming when:
 
 * Python 3
 * ROS 2
-* exiftool
-* OpenCV (cv2)
-* rclpy
-* cv_bridge
+* `exiftool`
+* OpenCV (`cv2`)
+* `rclpy`
+* `cv_bridge`
 
 ---
 
 ## Usage
 
-Basic streaming and bag recording:
+Basic bag recording:
 
 ```
-python3 stream_as_ros2.py \
+python3 main.py \
     --folder /path/to/images \
     --bag_name output_bag
 ```
@@ -77,57 +84,67 @@ python3 stream_as_ros2.py \
 
 ## Command-Line Arguments
 
---folder     (required)
+### --folder   (required)
+
 Directory containing JPG images to stream.
 
---bag_name   (required)
-Name of the ros2 bag file to record.
+### --bag_name (required)
 
---max_width
-Images are resized proportionally before publishing.
-Default: 640 pixels. Helps reduce processing time and memory.
+Name of the ROS 2 bag output file.
 
---hz
-Fixed publish rate in Hz. Default: 30.
-Used unless --real_time is enabled.
+### --max_width
 
---real_time   or   -rt
-Replay images according to their original EXIF timestamps.
-Useful for realistic flight playback.
+Resize images proportionally before publishing.
+Default: 640 pixels.
 
---max_workers
-Number of processes used when preloading.
+### --hz
+
+Fixed publish rate in Hz.
+Used unless `--real_time` is enabled.
+
+### --real_time  or  -rt
+
+Replay using real capture timestamps.
+**Requires `--preload`.**
+If preloading is not used, this flag has no effect.
+
+The computed real-time playback rate may vary depending on CPU load, system performance, and image sizes.
+
+### --max_workers
+
+Number of processes for preloading.
 Defaults to number of CPU cores.
 
---preload
-Enable preloading and multiprocessing for fast replay.
-Higher RAM usage but significantly faster streaming.
+### --preload
+
+Force preloading for faster throughput and support for real-time replay.
 
 ---
 
 ## Examples
 
-Stream at 30 Hz and record:
+Stream at 30 Hz:
 
 ```
-python3 stream_as_ros2.py \
-    --folder /data/skydio_run01 \
-    --bag_name skydio_bag01
+python3 main.py \
+    --folder /data/run01 \
+    --bag_name run01
 ```
 
-Replay using real capture timing:
+Replay with real capture timing (requires preload):
 
 ```
-python3 stream_as_ros2.py \
-    --folder /data/skydio_run01 \
+python3 main.py \
+    --folder /data/run01 \
     --real_time \
+    --preload \
     --bag_name realtime_bag
 ```
 
-Use 8 processes and large images:
+High-resolution preload example:
 
 ```
-python3 stream_as_ros2.py \
+python3 main.py \
     --folder imgs \
     --max_width 3840 \
     --hz 60 \
@@ -140,12 +157,19 @@ python3 stream_as_ros2.py \
 
 ## Performance Notes
 
-* Preloading is strongly recommended if:
+* **Real-time mode only works with preloading**, since timestamps are extracted in batch during that stage
+  (on-demand loading does not have timing data available ahead of time).
 
-  * Images are large, AND
-  * You want high publish rates (>30 Hz).
-* On-demand loading reduces RAM use, but publish rate is limited by
-  CPU decode + resize time per frame.
-* Large 8K images may require resizing (`--max_width`) to avoid CPU
-  bottlenecks during real-time streaming.
+* Even in real-time mode:
 
+  * Actual publishing Hz may vary with system load,
+  * Very large images may still introduce scheduling lag,
+  * Consider resizing (`--max_width`) for smoother playback.
+
+* For highest performance:
+
+  * Use preloading,
+  * Resize images,
+  * Increase worker count (`--max_workers`) on multi-core systems.
+
+On-demand streaming is still fully functional—just understand that the fixed `--hz` rate depends on how quickly your system can load and decode each frame.
