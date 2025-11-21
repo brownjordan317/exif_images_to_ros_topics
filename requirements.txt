@@ -1,0 +1,4 @@
+pyyaml
+numpy<2
+opencv-python
+tqdm

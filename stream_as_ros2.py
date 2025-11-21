@@ -8,8 +8,18 @@ import os
 import cv2
 from cv_bridge import CvBridge
 import glob
-from tqdm import tqdm
+import multiprocessing as mp
+from cv_bridge import CvBridge
+import cv2
+from halo import Halo
+import logging
+from datetime import datetime
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 class StreamSkydioOverROS(Node):
     def __init__(self, ros_images, exif_data, hz=30):
@@ -51,8 +61,9 @@ class StreamSkydioOverROS(Node):
 
     def timer_callback(self):
         """
-        Timer callback that publishes preloaded images and telemetry at a rate of {hz} Hz.
-        If all images have been published, the node will shutdown.
+        Timer callback that publishes preloaded images and telemetry at 
+        a rate of {hz} Hz. If all images have been published, the node will 
+        shutdown.
         """
         if self.current_index >= len(self.ros_images):
             self.get_logger().info("Finished streaming all images.")
@@ -117,63 +128,119 @@ def exif_data(image_path):
 def get_image_paths(folder):
     return sorted(glob.glob(os.path.join(folder, "*.JPG")))
 
-
-def preload_all(folder, max_width=640):
+def load_image_exif(args):
     """
-    Preload all images in a folder and extract their EXIF metadata.
+    Loads an image and associated EXIF metadata.
+
+    Args:
+        args (tuple): A tuple containing the path to the image file and
+            the maximum width to resize the image to.
+
+    Returns:
+        tuple: A tuple containing the ROS Image and a dictionary 
+            containing the extracted EXIF metadata.
+    """
+    path, max_width = args
+    bridge = CvBridge()
+    
+    # Load image
+    img = cv2.imread(path)
+    if img is None:
+        return None, None
+
+    # Resize if needed
+    if img.shape[1] > max_width:
+        scale = max_width / img.shape[1]
+        img = cv2.resize(img, None, fx=scale, fy=scale)
+
+    # Convert to ROS Image
+    ros_img = bridge.cv2_to_imgmsg(img, encoding="bgr8")
+
+    # Load EXIF
+    ex = exif_data(path)
+    exif_dict = {
+        "timestamp": datetime.strptime(
+            str(ex["Date/Time Original"]),
+            "%Y:%m:%d %H:%M:%S.%f"
+        ),
+        "latitude": float(ex["GPS Latitude Raw"]),
+        "longitude": float(ex["GPS Longitude Raw"]),
+        "altitude": float(ex["GPS Altitude Raw"]),
+        "vehicle_yaw": float(ex["Vehicle Orientation NED Yaw"])
+    }
+
+    return ros_img, exif_dict
+
+def calculate_rt_hz(timestamps):
+    """
+    Calculate the rate in Hertz of a given list of timestamps.
+
+    Args:
+        timestamps (list): A list of timestamps.
+
+    Returns:
+        float: The rate in Hertz of the given list of timestamps.
+    """
+    deltas = [
+        (t2 - t1).total_seconds()
+        for t1, t2 in zip(timestamps[:-1], timestamps[1:])
+    ]
+    avg_delta = sum(deltas) / len(deltas)
+    hz_rt = 1.0 / avg_delta if avg_delta > 0 else 30.0
+    return hz_rt
+
+def preload_all(folder, max_width=640, rt=False, num_workers=None):
+    """
+    Preload all images in a folder and associated EXIF metadata.
 
     Args:
         folder (str): Path to the folder containing the images.
-        max_width (int, optional): Maximum width of the images in pixels.
-            Defaults to 640.
+        max_width (int, optional): Maximum width to resize the images to. 
+        Defaults to 640. rt (bool, optional): If True, calculate the rate in 
+        Hertz of the preloaded images. Defaults to False. num_workers 
+        (int, optional): Number of workers to use in the pool. If None, use 
+        the number of available CPU cores. Defaults to None.
 
     Returns:
-        tuple: A tuple containing two lists. The first list contains ROS Image messages,
-            and the second list contains dictionaries containing the extracted EXIF metadata.
-    """
-    bridge = CvBridge()
+        tuple: A tuple containing a list of ROS Image messages, a list of 
+        dictionaries containing the associated EXIF metadata, and the rate in 
+        Hertz of the preloaded images if rt is True.
 
+    """
     image_paths = get_image_paths(folder)
     if not image_paths:
         print("No JPG files found.")
         return [], []
 
+    # Prepare arguments for pool
+    args_list = [(p, max_width) for p in image_paths]
+
+    num_workers = num_workers or mp.cpu_count()
     ros_images = []
     exif_list = []
 
-    for i, p in tqdm(enumerate(image_paths), 
-                     total=len(image_paths), 
-                     desc="Preloading images"
-                    ):
+    with mp.Pool(processes=num_workers) as pool:
+        for ros_img, exif_dict in pool.imap(load_image_exif, args_list):
+            if ros_img is None:
+                continue
+            ros_images.append(ros_img)
+            exif_list.append(exif_dict)
 
-        # Load image once
-        img = cv2.imread(p)
-        if img is None:
-            print("Failed to load:", p)
-            continue
+    if rt:
+        hz_rt = calculate_rt_hz([exif["timestamp"] for exif in exif_list])
+    else:
+        hz_rt = 0.0
 
-        # Resize once
-        if img.shape[1] > max_width:
-            scale = max_width / img.shape[1]
-            img = cv2.resize(img, None, fx=scale, fy=scale)
+    return ros_images, exif_list, hz_rt
 
-        # Convert to ROS Image once
-        ros_img = bridge.cv2_to_imgmsg(img, encoding="bgr8")
-        ros_images.append(ros_img)
+def read_args():
+    """
+    Parse command line arguments and return a parser object.
 
-        # Load EXIF once
-        ex = exif_data(p)
-        exif_list.append({
-            "latitude": float(ex["GPS Latitude Raw"]),
-            "longitude": float(ex["GPS Longitude Raw"]),
-            "altitude": float(ex["GPS Altitude Raw"]),
-            "vehicle_yaw": float(ex["Vehicle Orientation NED Yaw"])
-        })
-
-    return ros_images, exif_list
-
-
-def main(args=None):
+    Returns:
+        argparse.ArgumentParser: A parser object containing the parsed
+            command line arguments.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Stream Skydio JPG images over ROS 2 as if recorded live. "
@@ -201,14 +268,58 @@ def main(args=None):
         help="Publish rate in Hz (default: 30)."
     )
     parser.add_argument(
+        "-rt",
+        "--real_time",
+        action='store_true',
+        help="Stream images in real-time based on EXIF timestamps."
+    )
+    parser.add_argument(
         "--bag_name",
         required=True,
         help="Name of ros2 bag to record output into."
     )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=None,
+        help="Maximum number of worker processes for preloading images."
+    )
 
-    args = parser.parse_args()
+    return parser
 
-    ros_images, exif_data_list = preload_all(args.folder, args.max_width)
+
+def main(args=None):
+    
+    args = read_args().parse_args()
+
+    if not os.path.exists(args.folder):
+        print("Folder does not exist.")
+        return
+    
+    logger.info(f"Preloading images from {args.folder}...")
+    logger.info(f"Max width: {args.max_width}")
+    if args.real_time:
+        logger.info(f"Will stream in real-time based on EXIF timestamps.")
+    else:
+        logger.info(f"Will stream at fixed rate of {args.hz} Hz.")
+    logger.info(f"Ros2 bag will be saved as: {args.bag_name}")
+
+    spinner = Halo(
+        text=('Preloading images with '
+        f'{args.max_workers or mp.cpu_count()} workers...'), 
+        spinner='dots'
+    )
+    spinner.start()
+    ros_images, exif_data_list, hz_rt = preload_all(
+        args.folder, 
+        args.max_width,
+        args.real_time
+    )
+    if args.real_time and hz_rt > 0:
+        hz = hz_rt
+    else:
+        hz = args.hz
+    spinner.succeed(f"Finished preloading images. Streaming at {hz:.2f} Hz.")
 
     rclpy.init()
 
@@ -224,7 +335,7 @@ def main(args=None):
     node = StreamSkydioOverROS(
         ros_images,
         exif_data_list,
-        hz=args.hz
+        hz=hz
     )
 
     # Inject rosbag process so the node can stop it when done
